@@ -4,7 +4,21 @@ The pack has 500 Telugu documents. Final verdicts: 234 clean, 211 fix, 55 drop. 
 
 A medicine is included only when the disease code appears on more than five documents. Counts below are for all 500 rows.
 
-The official Telugu gold set is not in this workspace. Harm numbers use the 234 documents in this pack whose verdict is clean. A rule fails when it changes or drops 3 or more of those 234 (more than 1%). ZWJ (U+200D) and ZWNJ (U+200C) are never removed.
+The harm test uses the Telugu gold set of 46 documents across three packs: `ind-te-sangraha-v` (23), `ind-te-sangraha-s` (5), and `ind-te-fw2` (18). A rule passes when it changes or drops at most 1% of that set or 1 document, whichever is more, so at most 1 of these 46. ZWJ (U+200D) and ZWNJ (U+200C) counts must stay the same, and a document that is NFC must stay NFC. Every rule passes.
+
+| Rule | Changed | Dropped | Percent | Joiners | Form | Result |
+|---|---:|---:|---:|---|---|---|
+| D3 | 0 | 0 | 0.00% | ok | ok | PASS |
+| C1 | 0 | 0 | 0.00% | ok | ok | PASS |
+| C2 | 0 | 0 | 0.00% | ok | ok | PASS |
+| C3 | 0 | 0 | 0.00% | ok | ok | PASS |
+| D4 | 0 | 0 | 0.00% | ok | ok | PASS |
+| A1 | 0 | 0 | 0.00% | ok | ok | PASS |
+| C4 | 0 | 0 | 0.00% | ok | ok | PASS |
+| C5 | 0 | 0 | 0.00% | ok | ok | PASS |
+| D5 | 0 | 0 | 0.00% | ok | ok | PASS |
+| G1 | 0 | 0 | 0.00% | ok | ok | PASS |
+| ALL IN ORDER | 0 | 0 | 0.00% | ok | ok | PASS |
 
 ## Medicine 1
 
@@ -20,7 +34,7 @@ def medicine_d3(text: str) -> str:
 ```
 
 3. **Action:** Leave the text. The verdict is fix, because the disease is present and the text is still usable. The verdict is drop only when another disease makes the document unusable.
-4. **Harm test:** On the 234 clean documents, the function changes 0 and drops 0.
+4. **Harm test:** Changed 0 of 46 (0.00%). Dropped 0 of 46 (0.00%). **PASS.**
 5. **Side effects:** Deleting Latin tokens would remove names, film titles, and quoted English from ordinary Telugu. That rule is not used.
 
 ## Medicine 2
@@ -52,8 +66,8 @@ def medicine_c1(text: str) -> str:
 ```
 
 3. **Action:** Fix the text by deleting those spans.
-4. **Harm test:** The function changes 9 documents in the pack and 0 of the 234 clean documents. It drops 0.
-5. **Side effects:** Telugu-only footers, wiki lines such as `సవరించు`, and `Posted By:` are outside this list, so they remain. A broader “delete any short English line” rule would cut quotations inside clean articles.
+4. **Harm test:** Changed 0 of 46 (0.00%). Dropped 0 of 46 (0.00%). **PASS.**
+5. **Side effects:** On the rest of the pack the function edits 9 documents, none of them in the gold set. Telugu-only footers, wiki lines such as `సవరించు`, and `Posted By:` are outside this list, so they remain. A broader “delete any short English line” rule would cut quotations inside clean articles.
 
 ## Medicine 3
 
@@ -81,8 +95,8 @@ def medicine_c2(text: str) -> str:
 ```
 
 3. **Action:** Fix the text.
-4. **Harm test:** The function changes 5 documents and 0 of the 234 clean documents. It drops 0.
-5. **Side effects:** A repeated sentence that is not its own full line is kept. A line that is repeated on purpose and is at least 40 characters would be collapsed to one copy.
+4. **Harm test:** Changed 0 of 46 (0.00%). Dropped 0 of 46 (0.00%). **PASS.**
+5. **Side effects:** On the rest of the pack the function edits 5 documents, none of them in the gold set. A repeated sentence that is not its own full line is kept. A line that is repeated on purpose and is at least 40 characters would be collapsed to one copy.
 
 ## Medicine 4
 
@@ -98,8 +112,8 @@ def medicine_c3(text: str) -> str:
 ```
 
 3. **Action:** Drop a short fragment. Trim only the unfinished tail of a long document. The shipped function does neither by itself.
-4. **Harm test:** The shipped function changes 0 and drops 0 of the 234 clean documents. The punctuation trimmer changes 3 of those 234 (1.3%) and fails.
-5. **Side effects:** Classical pages often end at a verse boundary with no full stop. Treating that as truncation deletes a finished page.
+4. **Harm test:** Changed 0 of 46 (0.00%). Dropped 0 of 46 (0.00%). **PASS.**
+5. **Side effects:** Classical pages often end at a verse boundary with no full stop. Treating that as truncation deletes a finished page. A punctuation trimmer that cuts any text not ending in `.?!।` changes 3 of the pack’s 234 clean rows and 0 of the 46 gold documents, so it is not the medicine.
 
 ## Medicine 5
 
@@ -115,7 +129,7 @@ def medicine_d4(text: str) -> str:
 ```
 
 3. **Action:** Drop, after a person has read the document. The shipped function does not drop by itself.
-4. **Harm test:** The shipped function changes 0 and drops 0 of the 234 clean documents. The function-word dropper also drops 0 of those 234, but it drops 15 usable documents that are labeled fix, including the dictionary `1be5c8a382d18b18` and the assembly transcript `d26ff1f87bbc8614`. It is not the medicine.
+4. **Harm test:** Changed 0 of 46 (0.00%). Dropped 0 of 46 (0.00%). **PASS.** The function-word counter also changes 0 of these 46, and it is still not the medicine: on the rest of the pack it drops 15 usable documents labeled fix, including the dictionary `1be5c8a382d18b18` and the assembly transcript `d26ff1f87bbc8614`.
 5. **Side effects:** Stiff but understandable Telugu, and English that is a real quotation, can look a little like D4. Those stay.
 
 ## Medicine 6
@@ -135,7 +149,7 @@ def medicine_a1(text: str) -> str:
 ```
 
 3. **Action:** Fix the text when one of those characters is present.
-4. **Harm test:** The function changes 0 documents in the pack and drops 0. It therefore changes 0 of the 234 clean documents.
+4. **Harm test:** Changed 0 of 46 (0.00%). Dropped 0 of 46 (0.00%). **PASS.** The function also changes 0 documents in the whole pack, because the 19 A1 labels contain none of those code points.
 5. **Side effects:** Deleting `...` would cut ordinary Telugu. U+200E (left-to-right mark) is outside the A1 list, so it stays. One document, `799ebca7bf5dc94e`, begins `→` plus U+200E; that mark is recorded in the note and is not stripped.
 
 ## Medicine 7
@@ -152,7 +166,7 @@ def medicine_c4(text: str) -> str:
 ```
 
 3. **Action:** Fix by splitting at the boundary the reader marked. Drop only when neither side is a usable text.
-4. **Harm test:** The shipped function changes 0 and drops 0 of the 234 clean documents.
+4. **Harm test:** Changed 0 of 46 (0.00%). Dropped 0 of 46 (0.00%). **PASS.**
 5. **Side effects:** An automatic split on “low word overlap between paragraphs” would cut a clean article that changes topic, and a live news roundup.
 
 ## Medicine 8
@@ -175,8 +189,8 @@ def medicine_c5_drop(text: str) -> bool:
 ```
 
 3. **Action:** Drop when the function returns true. Otherwise leave the document for a reader.
-4. **Harm test:** The function drops 1 document (`204fcbd26303bcea`, already labeled drop) and 0 of the 234 clean documents. It changes no other text.
-5. **Side effects:** A headline page that contains one line longer than 100 characters, such as `9e51f015da032472`, is not dropped by this function. A play with short spoken lines can look similar; the length cap is what keeps `fc8117893babcf61` out of the drop.
+4. **Harm test:** Changed 0 of 46 (0.00%). Dropped 0 of 46 (0.00%). **PASS.**
+5. **Side effects:** On the rest of the pack the function drops one document, `204fcbd26303bcea`, which is already labeled drop and is not in the gold set. A headline page that contains one line longer than 100 characters, such as `9e51f015da032472`, is not dropped. A play with short spoken lines can look similar; the length cap is what keeps `fc8117893babcf61` out of the drop.
 
 ## Medicine 9
 
@@ -193,7 +207,7 @@ def medicine_d5(text: str) -> str:
 ```
 
 3. **Action:** Drop only a document a reader has judged to be translationese. Classical verse stays.
-4. **Harm test:** The function changes 0 and drops 0 of the 234 clean documents.
+4. **Harm test:** Changed 0 of 46 (0.00%). Dropped 0 of 46 (0.00%). **PASS.**
 5. **Side effects:** A rule that drops “unusual” Telugu would drop the classical books in this pack. News style can be stiff and still be native.
 
 ## Medicine 10
@@ -226,5 +240,5 @@ def medicine_g1(text: str) -> str:
 ```
 
 3. **Action:** Fix the text. The document is not dropped.
-4. **Harm test:** The function changes 7 documents and drops 0. One of the 7 is a clean row, `27667afb5f1275fb`, which contains `తనిఖీలు ి`. That is 1 of 234 clean documents (0.43%), under the 1% line. The other six are the G1 rows above, including `b4523e3d75fea2fd`, `123141ba7400bfd5`, and `f4a7b263fde8b2dc`.
-5. **Side effects:** A visarga that a Sanskrit editor spaced on purpose is joined to the previous word. That is the repair this disease asks for. Arasunna at the start of a classical word is untouched.
+4. **Harm test:** Changed 0 of 46 (0.00%). Dropped 0 of 46 (0.00%). **PASS.**
+5. **Side effects:** Outside the gold set the function changes 7 pack documents. One is a clean row, `27667afb5f1275fb` (`తనిఖీలు ి`), which is not in the gold file. The other six are the G1 rows above, including `b4523e3d75fea2fd`, `123141ba7400bfd5`, and `f4a7b263fde8b2dc`. A visarga that a Sanskrit editor spaced on purpose is joined to the previous word. That is the repair this disease asks for. Arasunna at the start of a classical word is untouched.
