@@ -28,7 +28,7 @@ import export_hf  # noqa: E402
 
 
 def check(checkpoint: Path, gguf: Path, server: Path, spec_path: Path | None = None, prompts: int = 16,
-          length: int = 48, tol: float = 0.05, seed: int = 0, drop_router_bias: bool = False) -> dict:
+          length: int = 48, tol: float = 0.05, seed: int = 0, drop_router_bias: bool = False, keep_biases: bool = False) -> dict:
     import torch
     sys.path.insert(0, str(export_hf.HARNESS))
     from week2.model import LanguageModel
@@ -44,9 +44,10 @@ def check(checkpoint: Path, gguf: Path, server: Path, spec_path: Path | None = N
     export_hf.load_reference(ref, {k: v if k.startswith('codec.') else bf16(v) for k, v in state.items()})
     table = bf16(export_hf.fold_ke2(state, spec['n_embd']))
     ref.embedding.forward = lambda ids: table[ids]
-    if export_hf.is_kas(state):   # the folded head, without the output bias that the GGUF cannot hold
+    if export_hf.is_kas(state):   # the folded head; the output bias only with --keep-biases (the patched llama.cpp holds it, in fp32)
         head_w = bf16(export_hf.fold_kas_head(state)[0])
-        ref.head.forward = lambda h: torch.nn.functional.linear(h, head_w)
+        head_b = state['head.unigram'].float() if keep_biases else None
+        ref.head.forward = lambda h: torch.nn.functional.linear(h, head_w, head_b)
     length = min(length, (spec['block_size'] or length + 1) - 1)   # the server caps its context at the trained one and needs room for the next token
     s = socket.socket(); s.bind(('127.0.0.1', 0)); port = s.getsockname()[1]; s.close()
     srv = subprocess.Popen([str(server), '-m', str(gguf), '--port', str(port), '-ngl', '0', '-c', str(2 * length),
@@ -92,10 +93,12 @@ def main():
     ap.add_argument('--spec', type=Path)
     ap.add_argument('--prompts', type=int, default=16)
     ap.add_argument('--drop-router-bias', action='store_true', help='give G5\'s model a zero router_bias, as the export does with the same flag')
+    ap.add_argument('--keep-biases', action='store_true', help='the GGUF was made with export_hf.py --keep-biases (needs the patched llama-server): '
+                    'G5\'s reference keeps head.unigram and router_bias')
     ap.add_argument('--tol', type=float, default=0.05)
     ap.add_argument('--out', type=Path, help='write the result as JSON')
     a = ap.parse_args()
-    r = check(a.checkpoint, a.gguf, a.llama_server, a.spec, a.prompts, tol=a.tol, drop_router_bias=a.drop_router_bias)
+    r = check(a.checkpoint, a.gguf, a.llama_server, a.spec, a.prompts, tol=a.tol, drop_router_bias=a.drop_router_bias, keep_biases=a.keep_biases)
     print(f'A3: same top-1 on {r["same_top1"]}/{r["prompts"]} prompts, max log-probability difference '
           f'{r["max_abs_logprob_diff"]:.4f} (limit {a.tol:g}): {"PASS" if r["passed"] else "FAIL"}', flush=True)
     if a.out:

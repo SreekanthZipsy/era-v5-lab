@@ -1,0 +1,92 @@
+diff --git a/conversion/__init__.py b/conversion/__init__.py
+index 8ce4cb7..e4d4c85 100644
+--- a/conversion/__init__.py
++++ b/conversion/__init__.py
+@@ -120,6 +120,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
+     "GraniteMoeForCausalLM": "granite",
+     "GraniteMoeHybridForCausalLM": "granite",
+     "GraniteMoeSharedForCausalLM": "granite",
++    "GraniteMoeSharedBiasForCausalLM": "granite",
+     "GraniteSwitchForCausalLM": "granite",
+     "GraniteSpeechForConditionalGeneration": "granite",
+     "GraniteSpeechPlusForConditionalGeneration": "granite",
+diff --git a/conversion/granite.py b/conversion/granite.py
+index 796d37c..bde5d00 100644
+--- a/conversion/granite.py
++++ b/conversion/granite.py
+@@ -176,7 +176,7 @@ class GraniteMoeSWAModel(GraniteSWAModel):
+         yield from super().modify_tensors(data_torch, name, bid)
+ 
+ 
+-@ModelBase.register("GraniteMoeForCausalLM", "GraniteMoeSharedForCausalLM")
++@ModelBase.register("GraniteMoeForCausalLM", "GraniteMoeSharedForCausalLM", "GraniteMoeSharedBiasForCausalLM")
+ @ModelBase.example("ibm-granite/granite-3.1-3b-a800m-instruct")
+ class GraniteMoeModel(GraniteModel):
+     """Conversion for IBM's GraniteMoeForCausalLM"""
+diff --git a/gguf-py/gguf/constants.py b/gguf-py/gguf/constants.py
+index a39d046..fa9c74a 100644
+--- a/gguf-py/gguf/constants.py
++++ b/gguf-py/gguf/constants.py
+@@ -4683,6 +4683,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
+         MODEL_TENSOR.FFN_GATE_SHEXP,
+         MODEL_TENSOR.FFN_UP_SHEXP,
+         MODEL_TENSOR.FFN_DOWN_SHEXP,
++        MODEL_TENSOR.FFN_EXP_PROBS_B,  # era-v5-lab G12: expert selection bias
+     ],
+     MODEL_ARCH.GRANITE_HYBRID: [
+         MODEL_TENSOR.TOKEN_EMBD,
+diff --git a/gguf-py/gguf/tensor_mapping.py b/gguf-py/gguf/tensor_mapping.py
+index 63301cc..efe0afd 100644
+--- a/gguf-py/gguf/tensor_mapping.py
++++ b/gguf-py/gguf/tensor_mapping.py
+@@ -540,6 +540,7 @@ class TensorNameMap:
+             "model.layers.{bid}.block_sparse_moe.gate.e_score_correction",  # kimi
+             "model.layers.{bid}.moe.router_bias",                           # step3.5 expert selection bias
+             "model.layers.{bid}.mlp.experts.e_score_correction",       # laguna
++            "model.layers.{bid}.block_sparse_moe.router.selection",         # era-v5-lab G12 granitemoeshared_bias
+         ),
+ 
+         # Feed-forward up
+diff --git a/src/models/granite-moe.cpp b/src/models/granite-moe.cpp
+index febe1bf..d44ff28 100644
+--- a/src/models/granite-moe.cpp
++++ b/src/models/granite-moe.cpp
+@@ -26,6 +26,7 @@ void llama_model_granite_moe::load_arch_tensors(llama_model_loader &) {
+     // output
+     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+     output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
++    output_b    = create_tensor(tn(LLM_TENSOR_OUTPUT,      "bias"),   {n_vocab},         TENSOR_NOT_REQUIRED); // era-v5-lab G12: optional output bias
+ 
+     // if output is NULL, init from the input tok embed
+     if (output == NULL) {
+@@ -64,6 +65,7 @@ void llama_model_granite_moe::load_arch_tensors(llama_model_loader &) {
+             layer.ffn_up_b   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "bias", i), {n_ff}, TENSOR_NOT_REQUIRED);
+         } else {
+             layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", i), {n_embd, n_expert}, 0);
++            layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert}, TENSOR_NOT_REQUIRED); // era-v5-lab G12: expert selection bias
+             layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff, n_expert}, TENSOR_NOT_REQUIRED);
+             layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {  n_ff, n_embd, n_expert}, 0);
+             layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff, n_expert}, 0);
+diff --git a/src/models/granite.cpp b/src/models/granite.cpp
+index 4cac495..48bc1fa 100644
+--- a/src/models/granite.cpp
++++ b/src/models/granite.cpp
+@@ -196,6 +196,9 @@ llama_model_granite::graph::graph(
+ 
+     // For Granite architectures - scale logits
+     cur = ggml_scale(ctx0, cur, 1.0f / hparams.f_logit_scale);
++    if (model.output_b != nullptr) { // era-v5-lab G12: optional output bias, added after the logit scale
++        cur = ggml_add(ctx0, cur, model.output_b);
++    }
+     cb(cur, "result_output", -1);
+     res->t_logits = cur;
+ }
+@@ -279,7 +282,7 @@ ggml_tensor * llama_model_granite::graph::build_layer_ffn(
+                 model.layers[il].ffn_up_exps,
+                 model.layers[il].ffn_gate_exps,
+                 model.layers[il].ffn_down_exps,
+-                nullptr,
++                model.layers[il].ffn_exp_probs_b, // era-v5-lab G12: selection-only bias (null for stock models)
+                 n_expert, n_expert_used,
+                 LLM_FFN_SILU, true,
+                 hparams.expert_weights_scale,

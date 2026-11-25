@@ -224,7 +224,8 @@ def prepare_checkpoint(args, py, work, name):
         if out.exists(): shutil.rmtree(out)
         run([py, EXPORT_HF, '--checkpoint', ckpt, '--out', out, '--tokenizer', args.tokenizer, '--bos', args.bos,
              '--eos', args.eos, '--verify', args.verify, *(['--spec', args.spec] if args.spec else []),
-             *(['--drop-router-bias'] if args.drop_router_bias else []), *(['--drop-head-bias'] if args.drop_head_bias else [])])
+             *(['--drop-router-bias'] if args.drop_router_bias else []), *(['--drop-head-bias'] if args.drop_head_bias else []),
+             *(['--keep-biases'] if args.keep_biases else [])])
     return out, json.loads(report.read_text(encoding='utf-8'))
 
 
@@ -439,6 +440,9 @@ def main():
                     'the exported model routes differently, and A1/A3 show by how much')
     ap.add_argument('--drop-head-bias', action='store_true', help='export a KAS V2 checkpoint without its output bias (export_hf.py): '
                     'GraniteMoeShared has no lm_head bias')
+    ap.add_argument('--keep-biases', action='store_true', help='export a G5 checkpoint with its output bias and router selection bias '
+                    '(export_hf.py --keep-biases). The GGUF then needs the patched llama.cpp (teams/12-quantization/llama_cpp_bias/): '
+                    'put it in --work as llama.cpp-<tag> and point --llama-bin at its build; stock llama.cpp, Ollama and vLLM cannot load it')
     ap.add_argument('--roundtrip', action='store_true', help='also run tokenizer/gguf_roundtrip.py on the bf16 GGUF: llama.cpp '
                     'must give the token ids of --tokenizer on held-out text (downloads about 20 MB the first time)')
     ap.add_argument('--no-a3', action='store_true', help="skip test A3 (llama.cpp on the bf16 GGUF against G5's model)")
@@ -509,7 +513,7 @@ def main():
         if not a3_path.exists():
             subprocess.run([str(py), str(CHECK_GGUF), '--checkpoint', str(Path(args.checkpoint).expanduser()), '--gguf', str(bf16),
                             '--llama-server', sbin, '--out', str(a3_path), *(['--spec', args.spec] if args.spec else []),
-                            *(['--drop-router-bias'] if args.drop_router_bias else [])])
+                            *(['--drop-router-bias'] if args.drop_router_bias else []), *(['--keep-biases'] if args.keep_biases else [])])
         if not a3_path.exists(): sys.exit('test A3 did not run (see the error above); --no-a3 skips it')
         a3 = json.loads(a3_path.read_text(encoding='utf-8'))
         if not a3['passed']:  # reported, not fatal: the limit is not calibrated on a trained checkpoint yet
