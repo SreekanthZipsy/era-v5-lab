@@ -32,6 +32,15 @@ the head becomes lm_head.weight = beta[L_v] * (positions_v @ W_out.T) + tok_u @ 
 The head also has an output bias (head.unigram, one value per token) that GraniteMoeShared cannot carry: the export
 stops unless --drop-head-bias is given, which exports without it and records its statistics and measured effect.
 
+--keep-biases (opt-in) keeps both biases instead of refusing or dropping them: lm_head.bias (= head.unigram) and, per layer,
+block_sparse_moe.router.selection.bias (= router_bias, used only to choose the experts, as in G5). transformers'
+GraniteMoeShared has neither, so the folder then carries modeling_granitemoeshared_bias.py (next to this script), and
+config.json gets model_type "granitemoeshared_bias" plus an auto_map to it: load it with trust_remote_code=True. A stock
+transformers stops with "model type not recognized" instead of loading the model without its biases; a stock class
+given these tensors by hand would ignore them ("weights not used"). The two bias tensors are stored in fp32 whatever
+--dtype is. llama.cpp needs the patch in teams/12-quantization/llama_cpp_bias/ to load the GGUF made from this folder;
+stock llama.cpp, Ollama and vLLM do not. A1 then compares G5's full model, biases included, with the custom class.
+
 --verify N runs test A1 of section 12: N random prompts through G5's model and through `transformers`'
 GraniteMoeSharedForCausalLM loaded from the export, both fp32 on CPU. It exits 1 unless the largest logit
 difference is below --verify-tol and the top-1 token is the same at every position.
@@ -242,8 +251,8 @@ def to_halves(w, n_heads: int):
     return w.reshape(n_heads, d, -1)[:, order, :].reshape(w.shape).contiguous()
 
 
-def convert_state(state: dict, spec: dict) -> dict:
-    """G5 state_dict -> GraniteMoeShared state_dict (fp32)."""
+def convert_state(state: dict, spec: dict, keep: dict | None = None) -> dict:
+    """G5 state_dict -> GraniteMoeShared state_dict (fp32). keep = {'head': bool, 'router': bool}: add the two biases."""
     import torch
     f = lambda k: state[k].float()
     out = {'model.embed_tokens.weight': fold_ke2(state, spec['n_embd']),
@@ -258,6 +267,7 @@ def convert_state(state: dict, spec: dict) -> dict:
         out[h + 'self_attn.v_proj.weight'] = f(g + 'attn.v.weight')
         out[h + 'self_attn.o_proj.weight'] = f(g + 'attn.o.weight')
         out[h + 'block_sparse_moe.router.layer.weight'] = f(g + 'moe.router.weight')
+        if keep and keep['router']: out[h + 'block_sparse_moe.router.selection.bias'] = state[g + 'moe.router_bias'].float()
         ex = lambda part: torch.stack([f(f'{g}moe.experts.{e}.{part}.weight') for e in range(E)])
         out[h + 'block_sparse_moe.input_linear.weight'] = torch.cat((ex('gate'), ex('up')), dim=1)   # [E, 2h, d], gate first
         out[h + 'block_sparse_moe.output_linear.weight'] = ex('down')                                # [E, d, h]
@@ -265,13 +275,24 @@ def convert_state(state: dict, spec: dict) -> dict:
             sh = lambda part, dim: torch.cat([f(f'{g}moe.shared.{s}.{part}.weight') for s in range(S)], dim=dim)
             out[h + 'shared_mlp.input_linear.weight'] = torch.cat((sh('gate', 0), sh('up', 0)), dim=0)
             out[h + 'shared_mlp.output_linear.weight'] = sh('down', 1)
+    if keep and keep['head']: out['lm_head.bias'] = state['head.unigram'].float()
     return out
 
 
-def hf_config(spec: dict, bos_id, eos_id, pad_id, dtype: str):
+def bias_module():
+    """modeling_granitemoeshared_bias.py, which sits next to this script and is copied into a --keep-biases export."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import modeling_granitemoeshared_bias
+    return modeling_granitemoeshared_bias
+
+
+def hf_config(spec: dict, bos_id, eos_id, pad_id, dtype: str, keep: dict | None = None):
     from transformers import GraniteMoeSharedConfig
     head_dim = spec['n_embd'] // spec['n_head']
-    return GraniteMoeSharedConfig(
+    biased = bool(keep and (keep['head'] or keep['router']))
+    M = bias_module() if biased else None
+    extra = dict(has_lm_head_bias=keep['head'], has_router_selection_bias=keep['router']) if biased else {}
+    cfg = (M.GraniteMoeSharedBiasConfig if biased else GraniteMoeSharedConfig)(**extra,
         vocab_size=spec['vocab_size'], hidden_size=spec['n_embd'], num_hidden_layers=spec['n_layer'],
         num_attention_heads=spec['n_head'], num_key_value_heads=spec['n_kv_head'],
         intermediate_size=spec['moe']['ffn_hidden'],
@@ -282,10 +303,15 @@ def hf_config(spec: dict, bos_id, eos_id, pad_id, dtype: str):
         attention_multiplier=head_dim ** -0.5, embedding_multiplier=1.0, residual_multiplier=1.0, logits_scaling=1.0,
         attention_dropout=0.0, tie_word_embeddings=False, use_cache=True, output_router_logits=False,
         bos_token_id=bos_id, eos_token_id=eos_id, pad_token_id=pad_id, torch_dtype=dtype,
-        architectures=['GraniteMoeSharedForCausalLM'])
+        architectures=['GraniteMoeSharedBiasForCausalLM' if biased else 'GraniteMoeSharedForCausalLM'])
+    if biased:
+        cfg.auto_map = {'AutoConfig': 'modeling_granitemoeshared_bias.GraniteMoeSharedBiasConfig',
+                        'AutoModelForCausalLM': 'modeling_granitemoeshared_bias.GraniteMoeSharedBiasForCausalLM'}
+    return cfg
 
 
-def verify(state: dict, spec: dict, config, new_state: dict, n_prompts: int, tol: float, seed: int = 0) -> dict:  # state may hold router_bias
+def verify(state: dict, spec: dict, config, new_state: dict, n_prompts: int, tol: float, seed: int = 0, hf_cls=None,
+           keep_head_bias: bool = False) -> dict:  # state may hold router_bias
     """Test A1: G5's LanguageModel against transformers' GraniteMoeSharedForCausalLM, fp32, random prompts."""
     import torch
     from transformers import GraniteMoeSharedForCausalLM
@@ -294,12 +320,12 @@ def verify(state: dict, spec: dict, config, new_state: dict, n_prompts: int, tol
     ref = LanguageModel(dict(spec, mtp='mtp_head.weight' in state), state['embedding.rows'].numpy(),
                         state['embedding.lengths'].numpy()).eval()
     load_reference(ref, state)
-    hf = GraniteMoeSharedForCausalLM(config).float().eval()
+    hf = (hf_cls or GraniteMoeSharedForCausalLM)(config).float().eval()
     hf.load_state_dict(new_state, strict=True)
     T = min(spec['block_size'] or 64, 64)
     gen = torch.Generator().manual_seed(seed)
     worst, same, total = 0.0, 0, 0
-    kas = is_kas(state)
+    kas = is_kas(state) and not keep_head_bias   # with the bias kept, G5's full logits are compared as they are
     eff = dict(same_top1=0, max_abs_logit_diff=0.0, kl_nats_sum=0.0)
     with torch.no_grad():
         for _ in range(n_prompts):
@@ -336,7 +362,8 @@ def token_id(tokenizer_json: Path, token: str):
 
 def export(checkpoint: Path, out: Path, spec_path: Path | None = None, tokenizer: Path | None = None,
            bos: str = '<|begin_of_text|>', eos: str = '<|endoftext|>', pad: str = '<|pad|>', dtype: str = 'bf16',
-           n_verify: int = 0, tol: float = 1e-3, drop_router_bias: bool = False, drop_head_bias: bool = False) -> dict:
+           n_verify: int = 0, tol: float = 1e-3, drop_router_bias: bool = False, drop_head_bias: bool = False,
+           keep_biases: bool = False) -> dict:
     import torch
     from safetensors.torch import save_file
     from transformers import GraniteMoeSharedForCausalLM
@@ -344,7 +371,8 @@ def export(checkpoint: Path, out: Path, spec_path: Path | None = None, tokenizer
     state = load_state(weights)
     spec = resolve_spec(state, load_spec(spec_path or found_spec))
     rb = router_bias_report(state, spec)
-    if rb['active'] and not drop_router_bias:
+    if keep_biases and (drop_router_bias or drop_head_bias): sys.exit('--keep-biases and --drop-router-bias / --drop-head-bias exclude each other')
+    if rb['active'] and not drop_router_bias and not keep_biases:
         sys.exit(f'refusing: {rb["layer"]} is not zero (largest absolute value {rb["max_abs"]:.3g}, bias_gamma {rb["bias_gamma"]}). '
                  f'The router_bias picks the experts in G5, and GraniteMoeShared (Hugging Face and llama.cpp) has no selection bias, '
                  f'so the exported model would route differently from the checkpoint. --drop-router-bias exports anyway; '
@@ -353,7 +381,7 @@ def export(checkpoint: Path, out: Path, spec_path: Path | None = None, tokenizer
     if is_kas(state):
         u = state['head.unigram'].float()
         kas_bias = dict(max_abs=float(u.abs().max()), std=float(u.std()), mean=float(u.mean()), min=float(u.min()), max=float(u.max()))
-        if kas_bias['max_abs'] > 0 and not drop_head_bias:
+        if kas_bias['max_abs'] > 0 and not drop_head_bias and not keep_biases:
             sys.exit(f'refusing: the KAS V2 head has an output bias (head.unigram, one value per token, largest absolute value '
                      f'{kas_bias["max_abs"]:.3g}, std {kas_bias["std"]:.3g}), and GraniteMoeShared (Hugging Face and llama.cpp) has no lm_head bias. '
                      f'The exported model would score every token without its log prior. --drop-head-bias exports anyway and records '
@@ -368,39 +396,42 @@ def export(checkpoint: Path, out: Path, spec_path: Path | None = None, tokenizer
             if ids[name] is None:
                 sys.exit(f'{tokenizer}: no special token {dict(bos=bos, eos=eos)[name]!r} (set --{name})')
     torch_dtype = dict(bf16=torch.bfloat16, fp32=torch.float32)[dtype]
-    config = hf_config(spec, ids['bos'], ids['eos'], ids['pad'], dict(bf16='bfloat16', fp32='float32')[dtype])
-    new_state = convert_state(state, spec)
+    keep = dict(head=bool(keep_biases and kas_bias is not None and kas_bias['max_abs'] > 0), router=bool(keep_biases and rb['active']))
+    config = hf_config(spec, ids['bos'], ids['eos'], ids['pad'], dict(bf16='bfloat16', fp32='float32')[dtype], keep)
+    hf_cls = bias_module().GraniteMoeSharedBiasForCausalLM if keep['head'] or keep['router'] else GraniteMoeSharedForCausalLM
+    new_state = convert_state(state, spec, keep)
     # the target key list and shapes come from transformers itself; both must match before anything is written
-    want = {k: tuple(v.shape) for k, v in GraniteMoeSharedForCausalLM(config).state_dict().items()}
+    want = {k: tuple(v.shape) for k, v in hf_cls(config).state_dict().items()}
     have = {k: tuple(v.shape) for k, v in new_state.items()}
     if want != have:
         diff = sorted(set(want) ^ set(have)) or [f'{k}: {have[k]} != {want[k]}' for k in want if have[k] != want[k]]
-        sys.exit(f'export does not match transformers\' GraniteMoeSharedForCausalLM: {diff[:5]}')
+        sys.exit(f'export does not match {hf_cls.__name__}: {diff[:5]}')
     report = dict(checkpoint=str(weights), checkpoint_sha256=file_sha256(weights), spec=spec, dtype=dtype,
                   parameters=sum(v.numel() for v in new_state.values()),
-                  dropped=sorted(k for k in state if k == 'mtp_head.weight' or k.startswith(('embedding.', 'codec.')) or k.endswith('.router_bias') or (kas_bias is not None and k.startswith('head.'))),
-                  token_ids=ids)
+                  dropped=sorted(k for k in state if k == 'mtp_head.weight' or k.startswith(('embedding.', 'codec.')) or (k.endswith('.router_bias') and not keep['router']) or (kas_bias is not None and k.startswith('head.') and not (keep['head'] and k == 'head.unigram'))),
+                  token_ids=ids, keep_biases=keep)
     report['router_bias'] = dict(
-        rb, action=('absent from the checkpoint' if not rb['present'] else 'dropped with --drop-router-bias' if rb['active']
+        rb, action=('absent from the checkpoint' if not rb['present'] else 'kept with --keep-biases (selection-only, router.selection.bias)' if keep['router']
+                    else 'dropped with --drop-router-bias' if rb['active']
                     else 'dropped: all zero' if rb['max_abs'] == 0 else 'dropped: bias_gamma is 0 or not set, so it never picked an expert'),
         **({'warning': f'routing differs from the checkpoint: {rb["layer"]} has max |router_bias| {rb["max_abs"]:.3g} (bias_gamma '
                        f'{rb["bias_gamma"]}), which GraniteMoeShared cannot represent. Read A1 and A3 with that in mind.'}
-           if rb['active'] else {}))
-    if rb['active']: print('WARNING:', report['router_bias']['warning'], flush=True)
+           if rb['active'] and not keep['router'] else {}))
+    if rb['active'] and not keep['router']: print('WARNING:', report['router_bias']['warning'], flush=True)
     if kas_bias is not None:
         report['kas_v2'] = dict(folded='input codec x projection -> embed_tokens [V, d]; head -> lm_head.weight [V, d] in id order',
-                                head_bias=dict(kas_bias, action='dropped with --drop-head-bias' if kas_bias['max_abs'] > 0 else 'all zero, dropped',
+                                head_bias=dict(kas_bias, action='kept with --keep-biases (lm_head.bias)' if keep['head'] else 'dropped with --drop-head-bias' if kas_bias['max_abs'] > 0 else 'all zero, dropped',
                                                **({'warning': 'the export has no unigram output bias: logits differ from the checkpoint by head.unigram '
-                                                              '(see verify.head_bias_effect)'} if kas_bias['max_abs'] > 0 else {})))
-        if kas_bias['max_abs'] > 0: print('WARNING:', report['kas_v2']['head_bias']['warning'], flush=True)
+                                                              '(see verify.head_bias_effect)'} if kas_bias['max_abs'] > 0 and not keep['head'] else {})))
+        if kas_bias['max_abs'] > 0 and not keep['head']: print('WARNING:', report['kas_v2']['head_bias']['warning'], flush=True)
     if n_verify:
-        report['verify'] = verify(state, spec, config, new_state, n_verify, tol)
+        report['verify'] = verify(state, spec, config, new_state, n_verify, tol, hf_cls=hf_cls, keep_head_bias=keep['head'])
         if kas_bias is not None and 'head_bias_effect' in report['verify']:
             report['kas_v2']['head_bias']['effect'] = report['verify']['head_bias_effect']
         v = report['verify']
         print(f'A1: max logit difference {v["max_abs_logit_diff"]:.3g} (limit {tol:g}), same top-1 on '
               f'{v["same_top1"]}/{v["positions"]} positions: {"PASS" if v["passed"] else "FAIL"}', flush=True)
-        if not v['passed'] and not rb['active']:   # with --drop-router-bias a difference is expected and is in the report
+        if not v['passed'] and (not rb['active'] or keep['router']):   # with --drop-router-bias a difference is expected and is in the report
             sys.exit(1)
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
@@ -408,8 +439,11 @@ def export(checkpoint: Path, out: Path, spec_path: Path | None = None, tokenizer
     (out / 'generation_config.json').write_text(json.dumps(
         {k: v for k, v in dict(bos_token_id=ids['bos'], eos_token_id=ids['eos'], pad_token_id=ids['pad']).items()
          if v is not None}, indent=2) + '\n', encoding='utf-8')
-    save_file({k: v.to(torch_dtype).contiguous() for k, v in new_state.items()}, str(out / 'model.safetensors'),
+    bias_keys = ('lm_head.bias', '.router.selection.bias')   # fp32 whatever --dtype is: unigram goes up to ~10, bf16 would be off by 0.03
+    save_file({k: (v if k.endswith(bias_keys) else v.to(torch_dtype)).contiguous() for k, v in new_state.items()}, str(out / 'model.safetensors'),
               metadata={'format': 'pt'})
+    if keep['head'] or keep['router']:
+        shutil.copyfile(Path(bias_module().__file__), out / 'modeling_granitemoeshared_bias.py')
     if tokenizer:
         shutil.copyfile(tokenizer, out / 'tokenizer.json')
         # nothing is added when encoding (as in teams/03-tokenizer/release/tokenizer_config.json)
@@ -438,10 +472,12 @@ def main():
     ap.add_argument('--verify-tol', type=float, default=1e-3, help='largest fp32 logit difference allowed in A1')
     ap.add_argument('--drop-router-bias', action='store_true', help='export a checkpoint whose router_bias is not zero, '
                     'although the exported model routes differently (recorded in export_report.json)')
+    ap.add_argument('--keep-biases', action='store_true', help='keep head.unigram (lm_head.bias) and router_bias (router.selection.bias) '
+                    'in a folder with its own modeling file (trust_remote_code); needs the patched llama.cpp for a GGUF')
     ap.add_argument('--drop-head-bias', action='store_true', help='export a KAS V2 checkpoint without its output bias (head.unigram), '
                     'which GraniteMoeShared cannot carry; the bias statistics and effect go to export_report.json')
     a = ap.parse_args()
-    export(a.checkpoint, a.out, a.spec, a.tokenizer, a.bos, a.eos, a.pad, a.dtype, a.verify, a.verify_tol, a.drop_router_bias, a.drop_head_bias)
+    export(a.checkpoint, a.out, a.spec, a.tokenizer, a.bos, a.eos, a.pad, a.dtype, a.verify, a.verify_tol, a.drop_router_bias, a.drop_head_bias, a.keep_biases)
 
 
 if __name__ == '__main__':

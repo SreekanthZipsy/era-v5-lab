@@ -294,5 +294,80 @@ class KasExportTests(unittest.TestCase):
         self.assertNotIn('lm_head.bias', t)
 
 
+class KeepBiasesTests(unittest.TestCase):
+    """--keep-biases: lm_head.bias and router.selection.bias go into the folder, with a modeling file; A1 passes with both."""
+    @classmethod
+    def setUpClass(cls):
+        cls.m = spec(vocab_size=131072, head_mode='kas_v2', moe=dict(bias_gamma=0.001))
+        cls.model = random_model(cls.m)
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_folder(self, model=None, m=None, bias=0.5):
+        state = (model or self.model).state_dict()
+        for k in [k for k in state if k.endswith('.router_bias')]:
+            state[k][1] = bias
+        run = self.dir / 'run'; run.mkdir(exist_ok=True)
+        torch.save({'model': state, 'step': 3}, run / 'checkpoint.pt')
+        (run / 'manifest.json').write_text(json.dumps({'config': {'model': m or self.m}}), encoding='utf-8')
+        return run
+
+    def test_both_biases_kept_and_a1_passes(self):
+        r = quiet_export(self.run_folder(), self.dir / 'hf', dtype='fp32', n_verify=3, tol=1e-4, keep_biases=True)
+        self.assertTrue(r['verify']['passed'], r['verify'])
+        self.assertNotIn('head_bias_effect', r['verify'])                 # nothing was dropped, so nothing to measure
+        self.assertEqual(r['keep_biases'], dict(head=True, router=True))
+        self.assertIn('kept with --keep-biases', r['router_bias']['action']); self.assertIn('kept', r['kas_v2']['head_bias']['action'])
+        from safetensors.torch import load_file
+        t = load_file(str(self.dir / 'hf' / 'model.safetensors'))
+        self.assertEqual(t['lm_head.bias'].dtype, torch.float32); self.assertEqual(tuple(t['lm_head.bias'].shape), (131072,))
+        self.assertEqual(float(t['model.layers.1.block_sparse_moe.router.selection.bias'][1]), 0.5)
+        cfg = json.loads((self.dir / 'hf' / 'config.json').read_text())
+        self.assertEqual((cfg['model_type'], cfg['architectures']), ('granitemoeshared_bias', ['GraniteMoeSharedBiasForCausalLM']))
+        self.assertTrue((self.dir / 'hf' / 'modeling_granitemoeshared_bias.py').exists())
+
+    def test_the_bias_changes_routing_so_a1_would_fail_without_it(self):
+        r = quiet_export(self.run_folder(), self.dir / 'hf', dtype='fp32', n_verify=3, tol=1e-4, drop_router_bias=True, drop_head_bias=True)
+        self.assertFalse(r['verify']['passed'])                           # the control: the same checkpoint with both biases dropped
+
+    def test_stock_transformers_does_not_know_the_model_type(self):
+        import transformers
+        quiet_export(self.run_folder(), self.dir / 'hf', dtype='fp32', keep_biases=True)
+        self.assertNotIn('granitemoeshared_bias', transformers.CONFIG_MAPPING)   # so a stock load fails instead of dropping the biases
+
+    def test_folder_reloads_through_trust_remote_code(self):
+        from transformers import AutoModelForCausalLM
+        quiet_export(self.run_folder(), self.dir / 'hf', dtype='fp32', keep_biases=True)
+        hf = AutoModelForCausalLM.from_pretrained(self.dir / 'hf', dtype=torch.float32, trust_remote_code=True).eval()
+        ids = torch.randint(0, 131072, (1, 16), generator=torch.Generator().manual_seed(2))
+        with torch.no_grad():
+            diff = (self.model.eval()(ids, torch.ones_like(ids, dtype=torch.bool)) - hf(input_ids=ids).logits).abs().max().item()
+        self.assertLess(diff, 1e-3)
+
+    def test_default_still_refuses_and_the_flags_exclude_each_other(self):
+        with self.assertRaises(SystemExit) as c:
+            quiet_export(self.run_folder(), self.dir / 'hf', dtype='fp32')
+        self.assertIn('--drop-router-bias', str(c.exception))
+        with self.assertRaises(SystemExit) as c:
+            quiet_export(self.run_folder(), self.dir / 'hf', dtype='fp32', keep_biases=True, drop_head_bias=True)
+        self.assertIn('exclude each other', str(c.exception))
+
+    def test_router_bias_alone_on_a_plain_head_model(self):
+        m = spec(moe=dict(bias_gamma=0.001))
+        r = quiet_export(self.run_folder(random_model(m), m), self.dir / 'hf', dtype='fp32', n_verify=4, tol=1e-4, keep_biases=True)
+        self.assertTrue(r['verify']['passed'], r['verify']); self.assertEqual(r['keep_biases'], dict(head=False, router=True))
+
+    def test_nothing_to_keep_gives_a_stock_folder(self):
+        m = spec(moe=dict(bias_gamma=0.001))
+        r = quiet_export(self.run_folder(random_model(m), m, bias=0.0), self.dir / 'hf', dtype='fp32', n_verify=2, tol=1e-4, keep_biases=True)
+        self.assertEqual(r['keep_biases'], dict(head=False, router=False))
+        self.assertEqual(json.loads((self.dir / 'hf' / 'config.json').read_text())['architectures'], ['GraniteMoeSharedForCausalLM'])
+        self.assertFalse((self.dir / 'hf' / 'modeling_granitemoeshared_bias.py').exists())
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=1)
